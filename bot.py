@@ -3,14 +3,15 @@ import hmac
 import hashlib
 import requests
 import os
+import json
 from datetime import datetime
 
 # --- Konfiqurasiya ---
 API_KEY = os.environ.get("BYBIT_API_KEY", "")
 API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 SYMBOL = "BTCUSDT"
-TRADE_AMOUNT = 10  # USDT - hər əməliyyatda istifadə ediləcək məbləğ
-CHECK_INTERVAL = 60  # saniyə - neçə saniyədən bir yoxlasın
+TRADE_AMOUNT = 10
+CHECK_INTERVAL = 60
 
 BASE_URL = "https://api.bybit.com"
 
@@ -18,9 +19,9 @@ def log(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {msg}")
 
-def sign(params, secret):
-    query = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+def get_signature(params_str, secret, timestamp):
+    sign_str = timestamp + API_KEY + "5000" + params_str
+    return hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
 
 def get_klines(symbol, interval="5", limit=50):
     url = f"{BASE_URL}/v5/market/kline"
@@ -28,7 +29,7 @@ def get_klines(symbol, interval="5", limit=50):
     r = requests.get(url, params=params, timeout=10)
     data = r.json()
     if data["retCode"] != 0:
-        log(f"Kline xətası: {data['retMsg']}")
+        log(f"Kline xetasi: {data['retMsg']}")
         return []
     closes = [float(item[4]) for item in data["result"]["list"]]
     closes.reverse()
@@ -56,15 +57,18 @@ def calc_rsi(prices, period=14):
 
 def get_balance(coin="USDT"):
     ts = str(int(time.time() * 1000))
-    params = {"accountType": "UNIFIED", "coin": coin}
-    sign_str = ts + API_KEY + "5000" + "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-    sig = hmac.new(API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-    headers = {"X-BAPI-API-KEY": API_KEY, "X-BAPI-TIMESTAMP": ts,
-               "X-BAPI-SIGN": sig, "X-BAPI-RECV-WINDOW": "5000"}
-    r = requests.get(f"{BASE_URL}/v5/account/wallet-balance", params=params, headers=headers, timeout=10)
+    params_str = f"accountType=UNIFIED&coin={coin}"
+    sig = get_signature(params_str, API_SECRET, ts)
+    headers = {
+        "X-BAPI-API-KEY": API_KEY,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-RECV-WINDOW": "5000"
+    }
+    r = requests.get(f"{BASE_URL}/v5/account/wallet-balance?accountType=UNIFIED&coin={coin}", headers=headers, timeout=10)
     data = r.json()
     if data["retCode"] != 0:
-        log(f"Balans xətası: {data['retMsg']}")
+        log(f"Balans xetasi: {data['retMsg']}")
         return 0
     coins = data["result"]["list"][0]["coin"]
     for c in coins:
@@ -74,19 +78,15 @@ def get_balance(coin="USDT"):
 
 def place_order(side, qty):
     ts = str(int(time.time() * 1000))
-    params = {
+    body = {
         "category": "spot",
         "symbol": SYMBOL,
         "side": side,
         "orderType": "Market",
-        "qty": str(qty),
+        "qty": str(qty)
     }
-    sign_str = ts + API_KEY + "5000" + str(params).replace("'", '"').replace(": ", ":").replace(", ", ",")
-    
-    import json
-    body = json.dumps(params)
-    sign_str2 = ts + API_KEY + "5000" + body
-    sig = hmac.new(API_SECRET.encode(), sign_str2.encode(), hashlib.sha256).hexdigest()
+    body_str = json.dumps(body)
+    sig = get_signature(body_str, API_SECRET, ts)
     headers = {
         "X-BAPI-API-KEY": API_KEY,
         "X-BAPI-TIMESTAMP": ts,
@@ -94,12 +94,12 @@ def place_order(side, qty):
         "X-BAPI-RECV-WINDOW": "5000",
         "Content-Type": "application/json"
     }
-    r = requests.post(f"{BASE_URL}/v5/order/create", data=body, headers=headers, timeout=10)
+    r = requests.post(f"{BASE_URL}/v5/order/create", data=body_str, headers=headers, timeout=10)
     data = r.json()
     if data["retCode"] != 0:
-        log(f"Order xətası: {data['retMsg']}")
+        log(f"Order xetasi: {data['retMsg']}")
         return False
-    log(f"✅ {side} ordera verildi! OrderId: {data['result']['orderId']}")
+    log(f"✅ {side} order verildi! OrderId: {data['result']['orderId']}")
     return True
 
 def get_price(symbol):
@@ -112,11 +112,11 @@ def get_price(symbol):
     return float(data["result"]["list"][0]["lastPrice"])
 
 def main():
-    log("🤖 Bot başladı!")
-    log(f"📊 Cüt: {SYMBOL} | Məbləğ: {TRADE_AMOUNT} USDT")
+    log("🤖 Bot basladi!")
+    log(f"📊 Cut: {SYMBOL} | Meblег: {TRADE_AMOUNT} USDT")
 
     if not API_KEY or not API_SECRET:
-        log("❌ API açarları tapılmadı! BYBIT_API_KEY və BYBIT_API_SECRET environment variable-larını yoxlayın.")
+        log("❌ API acarlari tapilmadi!")
         return
 
     last_signal = None
@@ -133,13 +133,12 @@ def main():
             rsi = calc_rsi(prices, 14)
 
             if not ma20 or not rsi:
-                log("⏳ Kifayət qədər data yoxdur, gözlənilir...")
+                log("Kifayet qeder data yoxdur...")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            log(f"💰 Qiymət: ${price:.2f} | MA20: ${ma20:.2f} | RSI: {rsi:.1f}")
+            log(f"💰 Qiymet: ${price:.2f} | MA20: ${ma20:.2f} | RSI: {rsi:.1f}")
 
-            # Siqnal məntiqi
             if price > ma20 and rsi < 35:
                 signal = "BUY"
             elif price < ma20 and rsi > 65:
@@ -147,32 +146,32 @@ def main():
             else:
                 signal = "WAIT"
 
-            log(f"🎯 Siqnal: {signal}")
+            log(f"🎯 Signal: {signal}")
 
             if signal == "BUY" and last_signal != "BUY":
                 usdt_balance = get_balance("USDT")
                 log(f"💵 USDT Balans: ${usdt_balance:.2f}")
                 if usdt_balance >= TRADE_AMOUNT:
                     qty = round(TRADE_AMOUNT / price, 6)
-                    log(f"📈 AL əməliyyatı: {qty} BTC")
+                    log(f"📈 AL emeliyyati: {qty} BTC")
                     if place_order("Buy", qty):
                         last_signal = "BUY"
                 else:
-                    log(f"⚠️ Kifayət qədər USDT yoxdur: ${usdt_balance:.2f}")
+                    log(f"⚠️ Kifayet qeder USDT yoxdur: ${usdt_balance:.2f}")
 
             elif signal == "SELL" and last_signal != "SELL":
                 btc_balance = get_balance("BTC")
                 log(f"₿ BTC Balans: {btc_balance:.6f}")
                 if btc_balance * price >= 10:
                     qty = round(btc_balance * 0.99, 6)
-                    log(f"📉 SAT əməliyyatı: {qty} BTC")
+                    log(f"📉 SAT emeliyyati: {qty} BTC")
                     if place_order("Sell", qty):
                         last_signal = "SELL"
                 else:
-                    log(f"⚠️ Kifayət qədər BTC yoxdur")
+                    log(f"⚠️ Kifayet qeder BTC yoxdur")
 
         except Exception as e:
-            log(f"❌ Xəta: {e}")
+            log(f"❌ Xeta: {e}")
 
         time.sleep(CHECK_INTERVAL)
 
