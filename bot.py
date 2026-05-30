@@ -5,11 +5,11 @@ import pandas as pd
 from datetime import datetime
 from pybit.unified_trading import HTTP
 
-# ── Oz melumatlrinizi buraya yazin ──
-BYBIT_API_KEY    = "VghcLq0JsHLke3jOkx"
-BYBIT_API_SECRET = "Gk9j5KkmbxrFruzmt4rVyUe9VAtsdiU0vmQ9"
-TELEGRAM_TOKEN   = "8559693389:AAE4AGE4w1GjlP7JyVCFzOD2kaNlAUujrAU"
-TELEGRAM_CHAT_ID = "6466063088 "
+# import os
+BYBIT_API_KEY    = os.environ["BYBIT_API_KEY"]
+BYBIT_API_SECRET = os.environ["BYBIT_API_SECRET"]
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL    = "SOLUSDT"
 INTERVAL  = "15"
