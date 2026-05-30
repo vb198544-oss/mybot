@@ -1,179 +1,244 @@
 import time
-import hmac
-import hashlib
+import logging
 import requests
-import os
-import json
+import pandas as pd
 from datetime import datetime
+from pybit.unified_trading import HTTP
 
-# --- Konfiqurasiya ---
-API_KEY = os.environ.get("BYBIT_API_KEY", "")
-API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
-SYMBOL = "BTCUSDT"
-TRADE_AMOUNT = 10
-CHECK_INTERVAL = 60
+# ── Oz melumatlrinizi buraya yazin ──
+BYBIT_API_KEY    = "VghcLq0JsHLke3jOkx"
+BYBIT_API_SECRET = "Gk9j5KkmbxrFruzmt4rVyUe9VAtsdiU0vmQ9"
+TELEGRAM_TOKEN   = "8559693389:AAE4AGE4w1GjlP7JyVCFzOD2kaNlAUujrAU"
+TELEGRAM_CHAT_ID = "6466063088 "
 
-BASE_URL = "https://api.bybit.com"
+SYMBOL    = "SOLUSDT"
+INTERVAL  = "15"
+LIMIT     = 200
+CHECK_SEC = 60 * 15
 
-def log(msg):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] {msg}")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger(__name__)
 
-def get_signature(params_str, secret, timestamp):
-    sign_str = timestamp + API_KEY + "5000" + params_str
-    return hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+session = HTTP(
+    testnet=False,
+    api_key=BYBIT_API_KEY,
+    api_secret=BYBIT_API_SECRET,
+)
 
-def get_klines(symbol, interval="5", limit=50):
-    url = f"{BASE_URL}/v5/market/kline"
-    params = {"category": "spot", "symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=10)
-    data = r.json()
-    if data["retCode"] != 0:
-        log(f"Kline xetasi: {data['retMsg']}")
-        return []
-    closes = [float(item[4]) for item in data["result"]["list"]]
-    closes.reverse()
-    return closes
+def get_klines():
+    resp = session.get_kline(
+        category="linear",
+        symbol=SYMBOL,
+        interval=INTERVAL,
+        limit=LIMIT,
+    )
+    raw = resp["result"]["list"]
+    df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume","turnover"])
+    df = df.astype({"ts":"int64","open":"float","high":"float",
+                    "low":"float","close":"float","volume":"float"})
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    df.sort_values("ts", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
-def calc_ma(prices, period):
-    if len(prices) < period:
-        return None
-    return sum(prices[-period:]) / period
-
-def calc_rsi(prices, period=14):
-    if len(prices) < period + 1:
-        return None
-    gains, losses = 0, 0
-    for i in range(len(prices) - period, len(prices)):
-        diff = prices[i] - prices[i-1]
-        if diff > 0:
-            gains += diff
-        else:
-            losses -= diff
-    if losses == 0:
-        return 100
-    rs = gains / losses
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss
     return 100 - (100 / (1 + rs))
 
-def get_balance(coin="USDT"):
-    ts = str(int(time.time() * 1000))
-    params_str = f"accountType=UNIFIED&coin={coin}"
-    sig = get_signature(params_str, API_SECRET, ts)
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-SIGN": sig,
-        "X-BAPI-RECV-WINDOW": "5000"
-    }
-    r = requests.get(f"{BASE_URL}/v5/account/wallet-balance?accountType=UNIFIED&coin={coin}", headers=headers, timeout=10)
-    data = r.json()
-    if data["retCode"] != 0:
-        log(f"Balans xetasi: {data['retMsg']}")
-        return 0
-    coins = data["result"]["list"][0]["coin"]
-    for c in coins:
-        if c["coin"] == coin:
-            return float(c["availableToWithdraw"])
-    return 0
+def calc_macd(series, fast=12, slow=26, signal=9):
+    ema_fast    = series.ewm(span=fast, adjust=False).mean()
+    ema_slow    = series.ewm(span=slow, adjust=False).mean()
+    macd_line   = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram   = macd_line - signal_line
+    return macd_line, signal_line, histogram
 
-def place_order(side, qty):
-    ts = str(int(time.time() * 1000))
-    body = {
-        "category": "spot",
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": str(qty)
-    }
-    body_str = json.dumps(body)
-    sig = get_signature(body_str, API_SECRET, ts)
-    headers = {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-SIGN": sig,
-        "X-BAPI-RECV-WINDOW": "5000",
-        "Content-Type": "application/json"
-    }
-    r = requests.post(f"{BASE_URL}/v5/order/create", data=body_str, headers=headers, timeout=10)
-    data = r.json()
-    if data["retCode"] != 0:
-        log(f"Order xetasi: {data['retMsg']}")
-        return False
-    log(f"✅ {side} order verildi! OrderId: {data['result']['orderId']}")
-    return True
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
-def get_price(symbol):
-    url = f"{BASE_URL}/v5/market/tickers"
-    params = {"category": "spot", "symbol": symbol}
-    r = requests.get(url, params=params, timeout=10)
-    data = r.json()
-    if data["retCode"] != 0:
-        return 0
-    return float(data["result"]["list"][0]["lastPrice"])
+def add_indicators(df):
+    df["rsi"]         = calc_rsi(df["close"])
+    macd, sig, hist   = calc_macd(df["close"])
+    df["macd"]        = macd
+    df["macd_signal"] = sig
+    df["macd_hist"]   = hist
+    df["ema50"]       = calc_ema(df["close"], 50)
+    df["ema200"]      = calc_ema(df["close"], 200)
+    return df
+
+def fibonacci_levels(df, lookback=50):
+    recent = df.tail(lookback)
+    high   = recent["high"].max()
+    low    = recent["low"].min()
+    diff   = high - low
+    return {
+        "swing_high": round(high, 4),
+        "fib_23":     round(high - diff * 0.236, 4),
+        "fib_38":     round(high - diff * 0.382, 4),
+        "fib_50":     round(high - diff * 0.500, 4),
+        "fib_61":     round(high - diff * 0.618, 4),
+        "fib_78":     round(high - diff * 0.786, 4),
+        "swing_low":  round(low, 4),
+    }
+
+def detect_elliott(df, lookback=60):
+    closes = df["close"].tail(lookback).values
+    pivots = []
+    for i in range(1, len(closes) - 1):
+        if closes[i] > closes[i-1] and closes[i] > closes[i+1]:
+            pivots.append(("H", closes[i]))
+        elif closes[i] < closes[i-1] and closes[i] < closes[i+1]:
+            pivots.append(("L", closes[i]))
+
+    if len(pivots) < 5:
+        return "Qeyri-mueyyen"
+
+    last5 = pivots[-5:]
+    types = [p[0] for p in last5]
+    vals  = [p[1] for p in last5]
+
+    if types == ["L","H","L","H","L"] and vals[1] > vals[0] and vals[3] > vals[1]:
+        return "Impuls Dalgasi (Yukselen) - 5-ci dalga gozelenir"
+    if types == ["H","L","H","L","H"] and vals[1] < vals[0] and vals[3] < vals[1]:
+        return "Impuls Dalgasi (Enen) - 5-ci dalga gozelenir"
+
+    last3 = pivots[-3:]
+    t3    = [p[0] for p in last3]
+    if t3 == ["H","L","H"]:
+        return "Korreksiya (A-B-C) - C enisi gozelenir"
+    if t3 == ["L","H","L"]:
+        return "Korreksiya (A-B-C) - C yukselist gozelenir"
+
+    return "Konsolidasiya fazasi"
+
+def generate_signal(df):
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    price = last["close"]
+
+    rsi             = last["rsi"]
+    macd_cross_up   = prev["macd"] < prev["macd_signal"] and last["macd"] > last["macd_signal"]
+    macd_cross_down = prev["macd"] > prev["macd_signal"] and last["macd"] < last["macd_signal"]
+    ema_bull        = last["ema50"] > last["ema200"]
+    ema_bear        = last["ema50"] < last["ema200"]
+
+    fib     = fibonacci_levels(df)
+    elliott = detect_elliott(df)
+    atr     = df["close"].diff().abs().tail(14).mean()
+
+    if 30 <= rsi <= 55 and macd_cross_up and ema_bull:
+        return {
+            "direction": "LONG",
+            "emoji": "LONG",
+            "price": price,
+            "sl":  round(price - atr * 1.5, 4),
+            "tp1": round(price + atr * 2,   4),
+            "tp2": round(price + atr * 3.5, 4),
+            "leverage": 10 if rsi < 45 else 7,
+            "rsi": round(rsi, 2),
+            "macd": round(last["macd"], 4),
+            "ema50": round(last["ema50"], 4),
+            "ema200": round(last["ema200"], 4),
+            "fib": fib,
+            "elliott": elliott,
+        }
+
+    if 45 <= rsi <= 70 and macd_cross_down and ema_bear:
+        return {
+            "direction": "SHORT",
+            "emoji": "SHORT",
+            "price": price,
+            "sl":  round(price + atr * 1.5, 4),
+            "tp1": round(price - atr * 2,   4),
+            "tp2": round(price - atr * 3.5, 4),
+            "leverage": 10 if rsi > 55 else 7,
+            "rsi": round(rsi, 2),
+            "macd": round(last["macd"], 4),
+            "ema50": round(last["ema50"], 4),
+            "ema200": round(last["ema200"], 4),
+            "fib": fib,
+            "elliott": elliott,
+        }
+
+    return None
+
+def send_telegram(signal):
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    d   = signal
+    fib = d["fib"]
+
+    if d["direction"] == "LONG":
+        yon = "LONG - AL"
+    else:
+        yon = "SHORT - SAT"
+
+    msg = (
+        "SOL/USDT SIQNALI\n"
+        "\n"
+        "Tarix: " + now + "\n"
+        "Istiqamet: " + yon + "\n"
+        "Giris: " + str(d["price"]) + " USDT\n"
+        "Stop Loss: " + str(d["sl"]) + " USDT\n"
+        "TP1: " + str(d["tp1"]) + " USDT\n"
+        "TP2: " + str(d["tp2"]) + " USDT\n"
+        "Leverage: " + str(d["leverage"]) + "x\n"
+        "\n"
+        "INDIKATORLAR\n"
+        "RSI: " + str(d["rsi"]) + "\n"
+        "MACD: " + str(d["macd"]) + "\n"
+        "EMA50: " + str(d["ema50"]) + "\n"
+        "EMA200: " + str(d["ema200"]) + "\n"
+        "\n"
+        "ELLIOTT DALGASI\n"
+        + d["elliott"] + "\n"
+        "\n"
+        "FIBONACCI\n"
+        "Swing High: " + str(fib["swing_high"]) + "\n"
+        "Fib 23.6%: " + str(fib["fib_23"]) + "\n"
+        "Fib 38.2%: " + str(fib["fib_38"]) + "\n"
+        "Fib 50.0%: " + str(fib["fib_50"]) + "\n"
+        "Fib 61.8%: " + str(fib["fib_61"]) + "\n"
+        "Fib 78.6%: " + str(fib["fib_78"]) + "\n"
+        "Swing Low: " + str(fib["swing_low"]) + "\n"
+        "\n"
+        "Risk idareetme qaidalerina emel edin!"
+    )
+
+    url  = "https://api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
+    r    = requests.post(url, data=data, timeout=10)
+    if r.status_code == 200:
+        log.info("Telegram siqnali gonderildi")
+    else:
+        log.error("Telegram xetasi: " + r.text)
 
 def main():
-    log("🤖 Bot basladi!")
-    log(f"📊 Cut: {SYMBOL} | Meblег: {TRADE_AMOUNT} USDT")
-
-    if not API_KEY or not API_SECRET:
-        log("❌ API acarlari tapilmadi!")
-        return
-
-    last_signal = None
+    log.info("SOL/USDT Signal Bot iwle bashladi")
+    last_signal_dir = None
 
     while True:
         try:
-            prices = get_klines(SYMBOL, interval="5", limit=50)
-            if not prices:
-                time.sleep(CHECK_INTERVAL)
-                continue
+            df     = get_klines()
+            df     = add_indicators(df)
+            signal = generate_signal(df)
 
-            price = get_price(SYMBOL)
-            ma20 = calc_ma(prices, 20)
-            rsi = calc_rsi(prices, 14)
-
-            if not ma20 or not rsi:
-                log("Kifayet qeder data yoxdur...")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            log(f"💰 Qiymet: ${price:.2f} | MA20: ${ma20:.2f} | RSI: {rsi:.1f}")
-
-            if price > ma20 and rsi < 35:
-                signal = "BUY"
-            elif price < ma20 and rsi > 65:
-                signal = "SELL"
+            if signal:
+                if signal["direction"] != last_signal_dir:
+                    send_telegram(signal)
+                    last_signal_dir = signal["direction"]
+                    log.info("Siqnal: " + signal["direction"] + " @ " + str(signal["price"]))
+                else:
+                    log.info("Eyni istiqamet - siqnal saxlanildi")
             else:
-                signal = "WAIT"
-
-            log(f"🎯 Signal: {signal}")
-
-            if signal == "BUY" and last_signal != "BUY":
-                usdt_balance = get_balance("USDT")
-                log(f"💵 USDT Balans: ${usdt_balance:.2f}")
-                if usdt_balance >= TRADE_AMOUNT:
-                    qty = round(TRADE_AMOUNT / price, 6)
-                    log(f"📈 AL emeliyyati: {qty} BTC")
-                    if place_order("Buy", qty):
-                        last_signal = "BUY"
-                else:
-                    log(f"⚠️ Kifayet qeder USDT yoxdur: ${usdt_balance:.2f}")
-
-            elif signal == "SELL" and last_signal != "SELL":
-                btc_balance = get_balance("BTC")
-                log(f"₿ BTC Balans: {btc_balance:.6f}")
-                if btc_balance * price >= 10:
-                    qty = round(btc_balance * 0.99, 6)
-                    log(f"📉 SAT emeliyyati: {qty} BTC")
-                    if place_order("Sell", qty):
-                        last_signal = "SELL"
-                else:
-                    log(f"⚠️ Kifayet qeder BTC yoxdur")
+                log.info("Siqnal yoxdur | Qiymet: " + str(df.iloc[-1]["close"]) + " | RSI: " + str(round(df.iloc[-1]["rsi"], 2)))
 
         except Exception as e:
-            log(f"❌ Xeta: {e}")
+            log.error("Xeta: " + str(e))
 
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(CHECK_SEC)
 
 if __name__ == "__main__":
     main()
